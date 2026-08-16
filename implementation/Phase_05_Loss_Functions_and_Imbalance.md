@@ -6,6 +6,10 @@ Priority: CRITICAL — directly impacts Macro F1 on minority classes
 GPU Required: No (definition only)
 Estimated Time: Implementation only
 Dependencies: Phase 0 (config, class weights)
+Key Changes (Optimization Update):
+  - Added sampling strategy comparison framework (§2, §14)
+  - Warning: avoid double-applying imbalance correction
+  - Clarified interaction between WeightedRandomSampler and class-weighted loss
 ```
 
 ---
@@ -235,6 +239,29 @@ def get_weighted_sampler(train_df):
 
 > [!TIP]
 > **Start with Focal Loss (γ=2.0) + WeightedRandomSampler.** This is the most aggressive imbalance handling and usually gives the best Macro F1. Dial back if you see training instability.
+
+> [!WARNING]
+> **Avoid double-applying imbalance correction (§2).** Using `WeightedRandomSampler` AND `use_class_weights: true` in Focal Loss simultaneously double-corrects for class imbalance. This can over-emphasize minority classes and destabilize training. Test these combinations in controlled experiments (see below).
+
+---
+
+## 5.4 Sampling Strategy Comparison Framework (§2, §14)
+
+> [!IMPORTANT]
+> **Run these 4 comparisons as part of the controlled experiment framework.** Keep the configuration that provides the best validation Macro F1.
+
+| Experiment | Sampler | Loss Weights | Expected Behavior |
+|------------|---------|-------------|-------------------|
+| **A** | Normal (shuffle) | No class weights | Baseline — model ignores minority classes |
+| **B** | WeightedRandomSampler | No class weights | Minority classes appear more often, standard loss |
+| **C** | Normal (shuffle) | Class-weighted Focal/CE | Standard sampling, loss compensates for imbalance |
+| **D** | WeightedRandomSampler | Class-weighted Focal/CE | **Double correction** — may over-emphasize minority |
+
+**Recommended approach (§2):**
+- Start with **B** (WeightedRandomSampler + standard Focal Loss without class weights)
+- If minority F1 is still low, try **C** (class-weighted loss only)
+- Only use **D** if experiments B and C both underperform
+- Always compare against **A** (baseline) to measure actual improvement
 
 ---
 

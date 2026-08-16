@@ -1,22 +1,34 @@
-# Phase 4 — Data Augmentation Pipeline
+# Phase 4 — Online Data Augmentation Pipeline
 
 ```
 Module: src/augment.py
-Priority: HIGH — augmentation is the primary regularizer for small datasets
+Priority: HIGH — online augmentation is the primary regularizer
 GPU Required: No (CPU-based transforms)
 Estimated Time: Implementation only, no training
-Dependencies: Phase 2 (dataset class), Phase 0 (config)
+Dependencies: Phase 2 (dataset class), Phase 3B (offline-augmented dataset), Phase 0 (config)
 ```
 
 ---
 
 ## 4.1 Objective
 
+> [!NOTE]
+> **This is ONLINE augmentation** — random transforms applied on-the-fly during each training epoch.
+> It works **on top of** Phase 3B's offline-augmented dataset (~5,720 images).
+> Each offline-augmented copy gets further randomized by online augmentation every epoch, creating **massive effective diversity**.
+>
+> | Layer | Phase | What happens | Effective multiplier |
+> |-------|-------|-------------|---------------------|
+> | **Offline** (Phase 3B) | Before training | Creates permanent new images on disk | ~2.1× (2,680 → 5,720) |
+> | **Online** (this phase) | During each epoch | Applies random transforms per batch | ∞ (different every epoch) |
+> | **CutMix/MixUp** (batch-level) | During each step | Mixes images within a batch | Further diversity |
+
 Build a comprehensive, configurable augmentation pipeline using **Albumentations** that:
-1. Prevents overfitting on 2,680 training images
-2. Applies **heavier augmentation to minority classes** (0, 3)
-3. Includes advanced techniques: CutMix, MixUp, Random Erasing
+1. Prevents overfitting on the ~5,720 expanded training images
+2. Applies **heavier augmentation to minority classes** (0, 3) — additional to offline aug
+3. Includes advanced batch-level techniques: CutMix, MixUp, Random Erasing
 4. Has three strength presets: light, medium, heavy
+5. Respects the configured resolution (192×192 fast mode or 224×224 quality mode)
 
 ---
 

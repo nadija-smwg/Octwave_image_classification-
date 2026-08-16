@@ -48,7 +48,8 @@ Octwave_image_classification-/
     ├── eda.py                   # Phase 1: Exploratory data analysis
     ├── data.py                  # Phase 2: Dataset, splits, loaders
     ├── noise.py                 # Phase 3: Noisy label detection
-    ├── augment.py               # Phase 4: Augmentation pipeline
+    ├── offline_augment.py       # Phase 3B: Offline augmentation + resolution ← NEW
+    ├── augment.py               # Phase 4: Online augmentation pipeline
     ├── losses.py                # Phase 5: Loss functions
     ├── model.py                 # Phase 6: Model architecture
     ├── train.py                 # Phase 7: Training loop
@@ -61,6 +62,7 @@ Octwave_image_classification-/
         ├── checkpoints/
         ├── logs/
         ├── noisy_report/
+        ├── augmentation/        # Offline aug validation images
         └── submissions/
 ```
 
@@ -96,11 +98,28 @@ pin_memory: true
 
 # --- Data / Splitting ---
 data:
-  image_size: 224             # Resize target (224 for EfficientNet, 224 for Swin)
+  image_size: 224             # Resize target (use 192 for fast mode)
   val_ratio: 0.2
   n_folds: 5
   use_scene_grouping: true    # Phase 2: perceptual-hash grouping
   hash_threshold: 10          # Hamming distance threshold for grouping
+
+# --- Resolution Optimization --- ← NEW
+resolution:
+  fast_mode: 192              # For experimentation / hyperparameter search
+  quality_mode: 224           # For final submission runs
+  use_fast_mode: false        # Toggle: true = 192×192, false = 224×224
+
+# --- Offline Augmentation (Phase 3B) --- ← NEW
+offline_aug:
+  enabled: true
+  output_dir: "Data/oct-wave-3-0-kaggle-challenge-02/images/augmented"
+  class_multipliers:           # Upsample minority classes to ~1,200–1,700 each
+    0: 4                       # Neither: 368 → ~1,472
+    1: 0                       # Tom: 1,252 (majority — no offline aug)
+    2: 2                       # Jerry: 841 → ~1,682
+    3: 6                       # Both: 219 → ~1,314
+  jpeg_quality: 90
 
 # --- Augmentation ---
 augmentation:
@@ -258,7 +277,8 @@ graph TD
     P0["Phase 0: Setup & Config"] --> P1["Phase 1: EDA"]
     P1 --> P2["Phase 2: Data Splitting"]
     P2 --> P3["Phase 3: Noisy Label Detection"]
-    P3 --> P4["Phase 4: Augmentation"]
+    P3 --> P3B["Phase 3B: Offline Augmentation & Resolution"]
+    P3B --> P4["Phase 4: Online Augmentation"]
     P4 --> P5["Phase 5: Loss Functions"]
     P5 --> P6["Phase 6: Model Architecture"]
     P6 --> P7["Phase 7: Training Loop"]
@@ -266,22 +286,26 @@ graph TD
     P8 --> P9["Phase 9: TTA & Inference"]
     P9 --> P10["Phase 10: Pseudo-Labeling"]
     P10 --> P11["Phase 11: Submission"]
+
+    style P3B fill:#4CAF50,stroke:#333,color:#fff
 ```
 
 ---
 
 ## 0.7 GPU Time Budget Estimate (Single Kaggle/Colab GPU)
 
-| Phase | Estimated Time |
-|-------|---------------|
-| EDA | 5–10 min |
-| Data splitting + hashing | 10–15 min |
-| Noisy label baseline | 20–30 min |
-| Single fold training (30 epochs) | 25–40 min |
-| 5-fold CV (single backbone) | 2–3.5 hours |
-| 3-backbone ensemble (5 folds each) | 6–10 hours |
-| TTA inference | 10–15 min |
-| Pseudo-labeling retrain | 1–2 hours |
+| Phase | @ 224×224 | @ 192×192 (fast mode) |
+|-------|-----------|----------------------|
+| EDA | 5–10 min | 5–10 min |
+| Data splitting + hashing | 10–15 min | 10–15 min |
+| Noisy label baseline | 20–30 min | 15–20 min |
+| **Offline augmentation (3B)** | **5–15 min (CPU)** | **5–15 min (CPU)** |
+| Single fold training (30 epochs, ~5,720 images) | 35–55 min | 25–40 min |
+| 5-fold CV (single backbone) | 3–4.5 hours | 2–3 hours |
+| 3-backbone ensemble (5 folds each) | 9–14 hours | 6–9 hours |
+| TTA inference | 10–15 min | 7–10 min |
+| Pseudo-labeling retrain | 1–2 hours | 45–90 min |
 
 > [!TIP]
-> **For time-constrained runs:** Use 3 folds instead of 5, single backbone (EfficientNetV2-S), and skip pseudo-labeling. This brings total to ~2–3 hours.
+> **For time-constrained runs:** Use `resolution.use_fast_mode: true` (192×192) + 3 folds + single backbone + skip pseudo-labeling. Total: ~2–3 hours.
+> **Dataset size note:** After offline augmentation, training set grows from 2,680 → ~5,720 images. Per-epoch time increases ~2×, but convergence is faster due to balanced classes.

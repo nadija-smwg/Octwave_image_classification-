@@ -6,6 +6,10 @@ Priority: CRITICAL — leaky splits will give false confidence
 GPU Required: No
 Estimated Time: 10–15 minutes
 Dependencies: Phase 1 outputs (duplicate_groups.json)
+Key Changes (Optimization Update):
+  - Added persistent_workers + prefetch_factor to DataLoader (§7)
+  - Added single holdout split for fast experiments (§14)
+  - Removed minority_transform from Dataset (§2 — use WeightedRandomSampler instead)
 ```
 
 ---
@@ -166,6 +170,9 @@ class TomJerryDataset(Dataset):
 
 **Purpose:** Build train and val DataLoaders with optional weighted sampling.
 
+> [!NOTE]
+> **Optimization Update (§7):** DataLoaders now include `persistent_workers=True` and `prefetch_factor=2` to reduce worker startup overhead and prefetch data efficiently. These are configurable via `cfg.dataloader`.
+
 **Implementation Details:**
 
 ```python
@@ -173,7 +180,7 @@ def create_dataloaders(train_df, val_df, cfg, train_transform, val_transform):
     train_dataset = TomJerryDataset(train_df, cfg.paths.image_dir, train_transform)
     val_dataset = TomJerryDataset(val_df, cfg.paths.image_dir, val_transform)
     
-    # Optional: WeightedRandomSampler for class balance
+    # Optional: WeightedRandomSampler for class balance (§2)
     if cfg.sampler.use_weighted_sampler:
         class_counts = train_df['appearance'].value_counts().sort_index().values
         class_weights = 1.0 / class_counts
@@ -189,8 +196,10 @@ def create_dataloaders(train_df, val_df, cfg, train_transform, val_transform):
         batch_size=cfg.training.batch_size,
         shuffle=shuffle,
         sampler=sampler,
-        num_workers=cfg.num_workers,
-        pin_memory=cfg.pin_memory,
+        num_workers=cfg.dataloader.num_workers,
+        pin_memory=cfg.dataloader.pin_memory,
+        persistent_workers=cfg.dataloader.persistent_workers,  # §7: Keep workers alive
+        prefetch_factor=cfg.dataloader.prefetch_factor,        # §7: Prefetch batches
         drop_last=True  # Prevent small last batch issues with BatchNorm
     )
     
@@ -198,8 +207,10 @@ def create_dataloaders(train_df, val_df, cfg, train_transform, val_transform):
         val_dataset,
         batch_size=cfg.training.batch_size * 2,  # No grad → can use larger batch
         shuffle=False,
-        num_workers=cfg.num_workers,
-        pin_memory=cfg.pin_memory,
+        num_workers=cfg.dataloader.num_workers,
+        pin_memory=cfg.dataloader.pin_memory,
+        persistent_workers=cfg.dataloader.persistent_workers,
+        prefetch_factor=cfg.dataloader.prefetch_factor,
         drop_last=False
     )
     
@@ -229,7 +240,38 @@ def create_dataloaders(train_df, val_df, cfg, train_transform, val_transform):
 
 ---
 
-## 2.6 Design Decisions
+## 2.6 Single Holdout Split (for Fast Experiments)
+
+> [!NOTE]
+> **Added per §14:** For controlled experiments (Exp 1–9), a single train/val split is faster than full K-fold. Use this during the exploration phase, then switch to K-fold for final model selection.
+
+```python
+def create_single_split(df, val_ratio=0.2, seed=42):
+    """
+    Create a single stratified group-aware train/val split.
+    
+    Used during exploration phase for fast experimentation.
+    For final model selection, use K-fold via create_scene_aware_folds().
+    """
+    from sklearn.model_selection import StratifiedGroupKFold
+    
+    sgkf = StratifiedGroupKFold(n_splits=int(1 / val_ratio), shuffle=True, random_state=seed)
+    # Take only the first fold
+    train_idx, val_idx = next(sgkf.split(df['filename'], df['appearance'], groups=df['group_id']))
+    
+    train_df = df.iloc[train_idx].reset_index(drop=True)
+    val_df = df.iloc[val_idx].reset_index(drop=True)
+    
+    print(f"Single split: Train={len(train_df)}, Val={len(val_df)}")
+    print(f"Train class dist: {train_df['appearance'].value_counts().sort_index().to_dict()}")
+    print(f"Val class dist:   {val_df['appearance'].value_counts().sort_index().to_dict()}")
+    
+    return train_df, val_df
+```
+
+---
+
+## 2.7 Design Decisions
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
@@ -238,3 +280,6 @@ def create_dataloaders(train_df, val_df, cfg, train_transform, val_transform):
 | Image loading | OpenCV | Faster than PIL, native albumentation support |
 | Val batch size | 2× train batch | No gradients stored → more memory available |
 | `drop_last=True` (train) | Yes | Prevents BatchNorm issues with batch_size=1 |
+| `persistent_workers` | `True` | Avoids worker restart overhead each epoch (§7) |
+| `prefetch_factor` | `2` | Prefetches batches to reduce data loading bottleneck (§7) |
+| Single holdout split | For exploration | Faster than K-fold during experiments 1–9 (§14) |

@@ -1,21 +1,42 @@
-# Phase 3B — Offline Data Augmentation & Resolution Optimization
+# Phase 3B — Offline Data Augmentation & Resolution Optimization (OPTIONAL)
 
 ```
 Module: src/offline_augment.py
-Priority: CRITICAL — 2,680 samples is too small; must expand before training
+Priority: OPTIONAL — online aug + WeightedRandomSampler is PRIMARY strategy (§1, §2)
 GPU Required: No (CPU-based image transforms)
 Estimated Time: 5–15 minutes (one-time generation)
 Dependencies: Phase 3 (noise detection — augment ONLY clean samples)
+Key Changes (Optimization Update):
+  - Demoted from CRITICAL to OPTIONAL (§1)
+  - Online augmentation is now the PRIMARY approach
+  - Only enable if online aug + sampling doesn't achieve target F1
+  - Removed Perspective transform (§3)
+  - Reduced rotation limits (§3)
+  - Updated resolution to 4-tier progressive resizing (§5)
 ```
 
 ---
 
 ## 3B.1 Problem Statement
 
-> [!WARNING]
-> **2,680 training images is dangerously small** for fine-tuning a deep CNN. With only 219 samples in Class 3 and 368 in Class 0, the model will severely underfit on minority classes regardless of loss weighting.
+> [!NOTE]
+> **Optimization Update:** This phase is now **OPTIONAL**. The primary strategy for handling the small dataset (2,680 images) and class imbalance is:
+> 1. **Online/on-the-fly augmentation** (Phase 4) — model sees different transformed versions each epoch
+> 2. **WeightedRandomSampler** (Phase 5) — minority classes appear more frequently
+>
+> Only enable offline augmentation if online aug + sampling alone doesn't achieve satisfactory Macro F1.
+>
+> **Why online aug is preferred (§1):**
+> - No unnecessary disk usage
+> - Effectively unlimited variations
+> - Reduces overfitting
+> - Works well with minority-class sampling
+> - Allows more experimentation
 
-**Solution:** **Offline augmentation** — physically create new image files by applying geometric and color transforms to existing images. This is different from online augmentation (Phase 4) which applies random transforms on-the-fly during each epoch.
+**When to consider offline augmentation:**
+- If online aug + weighted sampling gives Macro F1 < target
+- If you need a fixed expanded dataset for reproducibility
+- If specific minority classes (3: Both, 0: Neither) still underperform
 
 **Why both offline AND online augmentation?**
 
@@ -47,24 +68,28 @@ Combined: each offline-augmented copy gets further randomized by online augmenta
 
 ## 3B.3 Resolution Optimization
 
-### Resolution Strategy: Two-Tier Approach
+### Resolution Strategy: Four-Tier Progressive Resizing (§5, §18)
 
-| Phase | Resolution | Purpose |
-|-------|-----------|---------|
-| **Experimentation** (fast runs) | **192×192** | ~30% faster training, good enough for hyperparameter search |
-| **Final submission** (best quality) | **224×224** | Full detail, best accuracy for ensemble |
+| Tier | Resolution | Purpose |
+|------|----------:|---------|
+| **Exploration** | **128×128** | Fastest experimentation, ~4× faster than 256 |
+| **Exploration HQ** | **160×160** | Higher-quality exploration, still fast |
+| **Final** | **224×224** | Final training, standard ImageNet resolution |
+| **Final HQ** | **256×256** | Final high-res fine-tuning (if measurably better) |
 
-### Why 192×192 for Fast Runs?
+### Resolution Comparison
 
 | Resolution | Pixels | vs 224 | Training Speed | Accuracy Impact |
 |-----------|--------|--------|----------------|-----------------|
-| 160×160 | 25,600 | −49% | ~2× faster | −2–4% F1 (too much detail loss for Jerry) |
-| **192×192** | 36,864 | **−31%** | **~1.4× faster** | **−0.5–1% F1 (acceptable)** |
+| **128×128** | 16,384 | **−67%** | **~3–4× faster** | −2–4% F1 (acceptable for exploration) |
+| **160×160** | 25,600 | **−49%** | **~2× faster** | −1–2% F1 (good for exploration) |
 | 224×224 | 50,176 | baseline | baseline | baseline |
 | 256×256 | 65,536 | +31% | ~1.3× slower | +0.3–0.5% F1 (diminishing returns) |
 
 > [!IMPORTANT]
-> **Jerry is a small character.** Going below 192×192 risks losing details needed to distinguish Jerry-present vs Jerry-absent frames. Do NOT use 160×160 for final submissions.
+> **Exploration at 128×128 is for speed, not final accuracy.** Cartoon frames generally contain large, distinctive silhouettes and 128×128 is sufficient to distinguish the basic classification task during hyperparameter search.
+>
+> **Jerry is a small character.** For final submissions, use ≥224×224 to preserve fine details. Compare 224 vs 256 on validation Macro F1.
 
 ---
 
@@ -186,25 +211,30 @@ def get_offline_transforms():
     KEY PRINCIPLE: Each augmented copy should look like a plausible
     frame from the show, not a distorted mess.
     
-    We use a ReplayCompose so each copy gets a DIFFERENT random
-    combination of transforms.
+    CARTOON-SPECIFIC (§3):
+    - NO Perspective transform (cartoon frames are upright)
+    - NO aggressive rotation (frames are always right-side up)
+    - YES HorizontalFlip (preserves character identity)
+    - YES Color/Hue jitter (prevents color shortcuts like grey=Tom)
+    - YES RandomResizedCrop (characters appear at varying positions/scales)
     """
     return A.Compose([
         # --- Geometric transforms (change viewpoint/framing) ---
         A.OneOf([
             A.HorizontalFlip(p=1.0),
             A.ShiftScaleRotate(
-                shift_limit=0.08, scale_limit=0.15, rotate_limit=15,
+                shift_limit=0.08, scale_limit=0.15, rotate_limit=8,  # §3: reduced from 15° to 8°
                 border_mode=cv2.BORDER_REFLECT_101, p=1.0
             ),
             A.RandomResizedCrop(
                 height=480, width=640,  # Will be resized later during training
                 scale=(0.75, 1.0), ratio=(0.85, 1.15), p=1.0
             ),
-            A.Perspective(scale=(0.02, 0.06), p=1.0),
+            # REMOVED: A.Perspective (§3: unrealistic for upright cartoon frames)
         ], p=0.9),
         
         # --- Color transforms (change lighting/palette) ---
+        # §3: Moderate color jitter to prevent color shortcuts (grey=Tom, brown=Jerry)
         A.OneOf([
             A.RandomBrightnessContrast(
                 brightness_limit=0.25, contrast_limit=0.25, p=1.0
@@ -231,12 +261,12 @@ def get_offline_transforms():
 
 | Transform Type | What It Simulates | Why It Helps |
 |----------------|-------------------|-------------|
-| HorizontalFlip | Mirror scene | Doubles viewpoint diversity |
-| ShiftScaleRotate | Camera movement, zoom | Different framing of same content |
-| RandomResizedCrop | Different aspect ratios | Teaches model to handle cropped views |
-| Perspective | Slight 3D distortion | Robustness to viewpoint changes |
+| HorizontalFlip | Mirror scene | Doubles viewpoint diversity, preserves character identity |
+| ShiftScaleRotate (rotate ≤8°) | Slight camera movement, zoom | Different framing of same content (§3: limited rotation) |
+| RandomResizedCrop | Different positions/scales | Characters at varying distances |
+| ~~Perspective~~ | ~~3D distortion~~ | **REMOVED (§3): unrealistic for upright cartoon frames** |
 | BrightnessContrast | Different TV brightness settings | Color invariance |
-| HueSaturationValue | Different color reproduction | Handle color palette variations across episodes |
+| HueSaturationValue | Different color reproduction | Prevents color shortcuts (§3) |
 | CLAHE | Local contrast enhancement | Highlights details in dark scenes |
 | GaussianBlur/Noise | Lower quality capture | Robustness to quality variation |
 
@@ -391,19 +421,21 @@ def assign_augmented_to_folds(combined_df, folds):
 ```yaml
 # Add to config.yaml
 offline_aug:
-  enabled: true
+  enabled: false               # CHANGED: online aug is primary strategy (§1)
   output_dir: "Data/oct-wave-3-0-kaggle-challenge-02/images/augmented"
   class_multipliers:
     0: 4    # Neither: 368 → ~1,472
     1: 0    # Tom: 1,252 (no augmentation needed)
-    2: 2    # Jerry: 841 → ~1,682
+    2: 1    # Jerry: 841 → ~1,682
     3: 6    # Both: 219 → ~1,314
   jpeg_quality: 90
 
 resolution:
-  fast_mode: 192          # For experimentation / hyperparameter search
-  quality_mode: 224       # For final submission runs
-  use_fast_mode: false    # Toggle: true = 192, false = 224
+  exploration: 128           # Fast experimentation (128×128)
+  exploration_hq: 160        # Higher-quality exploration (160×160)
+  final: 224                 # Final training (224×224)
+  final_hq: 256              # Final high-res fine-tuning (256×256)
+  current: 128               # Active resolution for current run
 ```
 
 ---

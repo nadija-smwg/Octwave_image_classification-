@@ -4,8 +4,13 @@
 Module: src/infer.py
 Priority: HIGH — TTA is a free performance boost at inference
 GPU Required: Yes
-Estimated Time: 10–15 minutes for full ensemble + TTA
+Estimated Time: 2–5 minutes for ensemble + TTA (hflip only)
 Dependencies: Phase 8 (trained models)
+Key Changes (Optimization Update):
+  - Simplified default TTA to just horizontal flip (§15)
+  - Corner crops removed from default (add only if measured improvement)
+  - Added validation step: only keep TTA if it improves val Macro F1
+  - TTA disabled by default until best model is found
 ```
 
 ---
@@ -21,18 +26,26 @@ Run inference on the test set with:
 
 ## 9.2 TTA Strategy
 
-For each test image, create multiple augmented versions and average their predictions:
+> [!NOTE]
+> **Optimization Update (§15):** TTA should use only **light transforms**. Do not use aggressive transformations. Start with just horizontal flip, add more only if measured improvement.
 
-| TTA Transform | Description |
-|---------------|-------------|
-| **Original** | Standard resize + normalize (always included) |
-| **Horizontal flip** | Mirror image left-right |
-| **Top-left crop** | Crop 90% from top-left, resize |
-| **Top-right crop** | Crop 90% from top-right, resize |
-| **Bottom-left crop** | Crop 90% from bottom-left, resize |
-| **Bottom-right crop** | Crop 90% from bottom-right, resize |
+For each test image, create augmented versions and average their predictions:
 
-**Total predictions per image per model:** 6 (1 original + 5 augmented)
+| TTA Transform | Description | Default? |
+|---------------|-------------|----------|
+| **Original** | Standard resize + normalize (always included) | ✓ Always |
+| **Horizontal flip** | Mirror image left-right | ✓ Default |
+| Light color jitter | Slight brightness/contrast variation | Optional |
+| ~~Top-left crop~~ | ~~Crop 90% from top-left~~ | Removed from default |
+| ~~Other corner crops~~ | ~~Various 90% crops~~ | Removed from default |
+
+**Default predictions per image per model:** 2 (1 original + 1 hflip)
+
+> [!IMPORTANT]
+> **Validate TTA benefit (§15):** After applying TTA, compare validation Macro F1 with and without TTA. Only keep TTA if it provides measurable improvement. The validation step should be:
+> 1. Predict on validation set WITHOUT TTA → record Macro F1
+> 2. Predict on validation set WITH TTA → record Macro F1
+> 3. Keep TTA only if F1(with TTA) > F1(without TTA)
 
 ---
 
@@ -48,7 +61,7 @@ def get_tta_transforms(cfg):
     Create list of TTA transforms. Each produces a differently-augmented
     view of the same image.
     """
-    img_size = cfg.data.image_size
+    img_size = cfg.resolution.current  # Uses progressive resizing
     norm = A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     
     tta_list = []
@@ -71,25 +84,15 @@ def get_tta_transforms(cfg):
             norm,
             ToTensorV2(),
         ]))
-    
-    # 3. Corner crops
-    crop_size = int(img_size * 0.9)
-    crop_positions = {
-        "crop_tl": (0, 0),                           # top-left
-        "crop_tr": (0, img_size - crop_size),         # top-right
-        "crop_bl": (img_size - crop_size, 0),         # bottom-left
-        "crop_br": (img_size - crop_size, img_size - crop_size),  # bottom-right
-    }
-    
-    for crop_name, (y, x) in crop_positions.items():
-        if crop_name in cfg.tta.transforms:
-            tta_list.append(A.Compose([
-                A.Resize(img_size, img_size),
-                A.Crop(x_min=x, y_min=y, x_max=x + crop_size, y_max=y + crop_size),
-                A.Resize(img_size, img_size),
-                norm,
-                ToTensorV2(),
-            ]))
+        
+    # 3. Optional Light Color Jitter (only if added after validation)
+    if "color_jitter" in cfg.tta.transforms:
+        tta_list.append(A.Compose([
+            A.Resize(img_size, img_size),
+            A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=1.0),
+            norm,
+            ToTensorV2(),
+        ]))
     
     print(f"TTA: {len(tta_list)} transforms configured")
     return tta_list
@@ -124,8 +127,8 @@ def predict_with_tta(model, test_df, cfg):
         dataset = TomJerryDataset(test_df, cfg.paths.image_dir, transform, is_test=True)
         loader = DataLoader(
             dataset, batch_size=cfg.training.batch_size * 2,
-            shuffle=False, num_workers=cfg.num_workers,
-            pin_memory=cfg.pin_memory
+            shuffle=False, num_workers=cfg.dataloader.num_workers,
+            pin_memory=cfg.dataloader.pin_memory
         )
         
         batch_probs = []
@@ -270,14 +273,10 @@ graph TD
 
 ```yaml
 tta:
-  enabled: true
-  transforms:
-    - "hflip"
-    - "crop_tl"
-    - "crop_tr"
-    - "crop_bl"
-    - "crop_br"
-  n_augments: 5               # For reference (auto-computed from list)
+  enabled: false               # CHANGED: only enable after best model found (§15)
+  transforms: ["hflip"]        # CHANGED: start with just hflip (§15)
+  # Optional: ["hflip", "color_jitter"]
+  # Corner crops removed from default — add only if measured improvement
 ```
 
 ---
@@ -304,4 +303,5 @@ tta:
 | 15 models, 6× TTA | ~45 minutes |
 
 > [!TIP]
-> If time-constrained, use TTA with just 2 transforms (original + hflip). This gives ~80% of the TTA benefit in ~33% of the time.
+> **Default TTA (§15):** Use just original + hflip (2 transforms). This gives ~80% of the TTA benefit in ~33% of the time compared to 6-transform TTA.
+> **Only add more transforms** if validation shows measurable Macro F1 improvement.

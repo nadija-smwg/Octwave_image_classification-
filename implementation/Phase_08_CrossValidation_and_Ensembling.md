@@ -12,6 +12,9 @@ Dependencies: Phases 2–7 (everything up to training)
 
 ## 8.1 Objective
 
+> [!WARNING]
+> **Optimization Update (§16):** Only attempt ensembling **after** optimizing the individual model through controlled experiments (Phase 7B). Do not use an ensemble merely to increase complexity. Evaluate whether the ensemble actually improves Macro F1 compared to the best single model.
+
 1. Train across **K folds** to get robust local CV estimate
 2. **Average softmax probabilities** across fold models for prediction
 3. Support **multi-architecture ensembling** (different backbones, not just different folds)
@@ -235,7 +238,7 @@ def predict_probs(model, df, cfg, transform=None):
     dataset = TomJerryDataset(df, cfg.paths.image_dir, transform, is_test=True)
     loader = DataLoader(
         dataset, batch_size=cfg.training.batch_size * 2,
-        shuffle=False, num_workers=cfg.num_workers
+        shuffle=False, num_workers=cfg.dataloader.num_workers
     )
     
     model.eval()

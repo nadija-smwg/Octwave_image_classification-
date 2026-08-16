@@ -6,6 +6,10 @@ Priority: CRITICAL — the model is the core of the pipeline
 GPU Required: Yes (for model instantiation and testing)
 Estimated Time: Implementation only
 Dependencies: Phase 0 (config)
+Key Changes (Optimization Update):
+  - Added lightweight backbones for exploration phase (§8)
+  - Default backbone changed to efficientnet_b0 for fast exploration
+  - Added dropout range guidance: 0.2–0.4 (§10)
 ```
 
 ---
@@ -22,15 +26,26 @@ Build a flexible model wrapper that:
 
 ## 6.2 Backbone Options
 
-| Backbone | timm Name | Params | ImageNet Top-1 | Speed (imgs/sec, T4) | Recommended For |
-|----------|-----------|--------|---------------|----------------------|-----------------|
-| EfficientNetV2-S | `tf_efficientnetv2_s` | 21.5M | 83.9% | ~450 | **Default** — best speed/accuracy tradeoff |
-| ConvNeXt-Tiny | `convnext_tiny` | 28.6M | 82.1% | ~400 | Strong CNN alternative |
+### Exploration Phase Backbones (§8 — Fast Experimentation)
+
+| Backbone | timm Name | Params | ImageNet Top-1 | Speed (imgs/sec, T4) | Use Case |
+|----------|-----------|--------|---------------|----------------------|----------|
+| **EfficientNet-B0** | `efficientnet_b0` | **5.3M** | 77.1% | **~900** | **Default for exploration** — fastest with good accuracy |
+| ResNet18 | `resnet18` | 11.7M | 69.8% | ~1200 | Alternative lightweight backbone |
+| MobileNetV3-Small | `mobilenetv3_small_100` | 2.5M | 67.5% | ~1500 | Fastest, use for very quick experiments |
+
+### Final Training Backbones (§8 — Best Performance)
+
+| Backbone | timm Name | Params | ImageNet Top-1 | Speed (imgs/sec, T4) | Use Case |
+|----------|-----------|--------|---------------|----------------------|----------|
+| **EfficientNetV2-S** | `tf_efficientnetv2_s` | 21.5M | 83.9% | ~450 | **Default for final** — best speed/accuracy tradeoff |
+| ConvNeXt-Tiny | `convnext_tiny` | 28.6M | 82.1% | ~400 | Strong CNN alternative, ensemble diversity |
 | Swin-Tiny | `swin_tiny_patch4_window7_224` | 28.3M | 81.3% | ~350 | Vision Transformer diversity for ensemble |
 
 > [!TIP]
-> **For single-model runs:** Use EfficientNetV2-S (fastest, highest accuracy).
-> **For ensembles:** Use all three to get architecture diversity — reduces correlated errors.
+> **Exploration phase (§8, §14):** Use `efficientnet_b0` (5.3M params, ~2× faster than EfficientNetV2-S). Run experiments 1–9 with this backbone.
+> **Final training:** Switch to `efficientnetv2_s` for the best single-model performance.
+> **Ensembles (§16):** Use all three final backbones to get architecture diversity — reduces correlated errors. Only attempt after optimizing the individual model.
 
 ---
 
@@ -86,6 +101,11 @@ class TomJerryClassifier(nn.Module):
     def _resolve_backbone_name(self, name):
         """Map friendly names to timm model names."""
         mapping = {
+            # Exploration backbones (§8)
+            "efficientnet_b0": "efficientnet_b0",
+            "resnet18": "resnet18",
+            "mobilenetv3_small": "mobilenetv3_small_100",
+            # Final training backbones
             "efficientnetv2_s": "tf_efficientnetv2_s",
             "convnext_tiny": "convnext_tiny",
             "swin_tiny": "swin_tiny_patch4_window7_224",
@@ -305,16 +325,19 @@ def print_model_summary(model, cfg):
 
 ```yaml
 model:
-  backbone: "efficientnetv2_s"    # "efficientnetv2_s" | "convnext_tiny" | "swin_tiny"
+  backbone: "efficientnet_b0"      # CHANGED: start lightweight for exploration (§8)
+  # Exploration: "efficientnet_b0" | "resnet18" | "mobilenetv3_small"
+  # Final:      "efficientnetv2_s" | "convnext_tiny" | "swin_tiny"
   pretrained: true
-  drop_rate: 0.3                  # Dropout in head
-  drop_path_rate: 0.2             # Stochastic depth in backbone
+  drop_rate: 0.3                  # Range: 0.2–0.4 (§10: tunable via experiments)
+  drop_path_rate: 0.1             # Stochastic depth (lower for small backbones)
 
 training:
-  freeze_backbone_epochs: 5       # Phase (a) duration
-  backbone_lr_factor: 0.1         # Phase (b) backbone LR = lr × this
-  lr: 3.0e-4                      # Head LR
-  weight_decay: 1.0e-4
+  freeze_backbone_epochs: 5       # Stage 1 duration (§9)
+  backbone_lr_factor: 0.1         # Stage 2 backbone LR = lr × this
+  lr: 1.0e-3                      # Head LR for Stage 1 (§9)
+  fine_tune_lr: 1.0e-4            # Fine-tuning LR for Stage 2 (§9)
+  weight_decay: 1.0e-4            # AdamW regularization (§10)
 ```
 
 ---

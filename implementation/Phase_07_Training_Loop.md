@@ -4,8 +4,15 @@
 Module: src/train.py
 Priority: CRITICAL — where everything comes together
 GPU Required: Yes
-Estimated Time: 25–40 minutes per fold (single backbone)
+Estimated Time: 5–9 min per fold @ 128×128 (exploration), 30–50 min @ 224×224 (final)
 Dependencies: Phases 2–6 (data, augmentation, loss, model)
+Key Changes (Optimization Update):
+  - Added configurable validation frequency: val_every_n_epochs (§13)
+  - Added GPU memory tracking per epoch (§14)
+  - Added training time tracking per epoch (§14)
+  - Added ExperimentTracker logging to CSV (§14)
+  - Updated CutMix/MixUp to be individually toggleable (§3, §14)
+  - Updated LR starting points (§9: head LR ≈ 1e-3, fine-tune LR ≈ 1e-4)
 ```
 
 ---
@@ -13,13 +20,16 @@ Dependencies: Phases 2–6 (data, augmentation, loss, model)
 ## 7.1 Objective
 
 Build a production-grade training loop with:
-1. **Mixed precision (AMP)** for 2× speedup
-2. **Two-phase fine-tuning** (frozen → full)
-3. **CutMix/MixUp** integration
-4. **Per-class F1 logging** at every validation step
-5. **Confusion matrix** per epoch
-6. **Early stopping** on validation Macro F1 (not loss)
+1. **Mixed precision (AMP)** for 2× speedup (§6)
+2. **Two-stage transfer learning** (frozen → full) (§9)
+3. **CutMix/MixUp** integration (individually toggleable, §3)
+4. **Per-class F1 logging** at validation steps
+5. **Confusion matrix** per validation step
+6. **Early stopping** on validation Macro F1 (not loss) (§12)
 7. **Gradient clipping** for stability
+8. **Validation frequency control** (§13: every N epochs during exploration)
+9. **GPU memory + training time tracking** (§14)
+10. **Experiment logging** to CSV (§14)
 
 ---
 
@@ -64,11 +74,12 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, scaler, cfg,
         images = images.to(cfg.device, non_blocking=True)
         labels = labels.to(cfg.device, non_blocking=True)
         
-        # ---- CutMix / MixUp (batch-level augmentation) ----
+        # ---- CutMix / MixUp (batch-level augmentation, §3) ----
+        # NOTE: Only one of CutMix or MixUp should be enabled at a time (§14)
         use_mix = False
         if epoch >= cfg.training.freeze_backbone_epochs:  # Only after warmup
             r = np.random.rand()
-            if cfg.augmentation.use_cutmix and r < 0.25:
+            if cfg.augmentation.use_cutmix and r < 0.5:
                 images, labels_a, labels_b, lam = cutmix_data(
                     images, labels, cfg.augmentation.cutmix_alpha
                 )
@@ -198,18 +209,23 @@ def train_fold(fold_idx, train_df, val_df, cfg):
             'best_macro_f1': float,
             'best_epoch': int,
             'best_model_path': str,
-            'history': list of epoch metrics
+            'history': list of epoch metrics,
+            'total_time_seconds': float,
+            'peak_gpu_memory_mb': float
         }
     """
+    import time
+    fold_start_time = time.time()
+    
     print(f"\n{'='*60}")
     print(f"FOLD {fold_idx}")
     print(f"Train: {len(train_df)} | Val: {len(val_df)}")
+    print(f"Resolution: {cfg.resolution.current}×{cfg.resolution.current}")
     print(f"{'='*60}\n")
     
     # ---- 1. Create transforms ----
     train_transform = get_train_transform(cfg)
     val_transform = get_val_transform(cfg)
-    minority_transform = get_minority_transform(cfg) if cfg.augmentation.minority_extra_aug else None
     
     # ---- 2. Create dataloaders ----
     train_loader, val_loader = create_dataloaders(
@@ -238,9 +254,12 @@ def train_fold(fold_idx, train_df, val_df, cfg):
     best_f1 = 0.0
     best_epoch = 0
     best_model_path = None
+    peak_gpu_mb = 0.0
     
     for epoch in range(cfg.training.epochs):
-        # Phase transition
+        epoch_start = time.time()
+        
+        # Phase transition (§9: Two-stage transfer learning)
         if epoch == 0:
             model.freeze_backbone()
             optimizer = get_head_only_optimizer(model, cfg)
@@ -255,61 +274,94 @@ def train_fold(fold_idx, train_df, val_df, cfg):
             model, train_loader, criterion, optimizer, scheduler, scaler, cfg, epoch
         )
         
-        # Validate
-        val_metrics = validate_one_epoch(
-            model, val_loader, criterion, cfg, epoch
+        # ---- Validation frequency control (§13) ----
+        # During exploration: validate every N epochs to save time
+        # During final training: validate every epoch
+        should_validate = (
+            epoch % cfg.experiment.val_every_n_epochs == 0 or
+            epoch == cfg.training.epochs - 1 or
+            epoch == cfg.training.freeze_backbone_epochs  # Always validate at phase transition
         )
         
-        # ---- Log metrics ----
-        print(f"\nEpoch {epoch}/{cfg.training.epochs-1}")
-        print(f"  Train Loss: {train_metrics['loss']:.4f} | LR: {train_metrics['lr']:.6f}")
-        print(f"  Val Loss:   {val_metrics['loss']:.4f}")
-        print(f"  Val Macro F1: {val_metrics['macro_f1']:.4f}")
-        print(f"  Per-class F1:")
-        for cls_name, f1 in val_metrics['per_class_f1'].items():
-            marker = " ← DRAGGING" if f1 < val_metrics['macro_f1'] - 0.05 else ""
-            print(f"    {cls_name}: {f1:.4f}{marker}")
+        if should_validate:
+            val_metrics = validate_one_epoch(
+                model, val_loader, criterion, cfg, epoch
+            )
+            
+            # ---- Log metrics ----
+            print(f"\nEpoch {epoch}/{cfg.training.epochs-1}")
+            print(f"  Train Loss: {train_metrics['loss']:.4f} | LR: {train_metrics['lr']:.6f}")
+            print(f"  Val Loss:   {val_metrics['loss']:.4f}")
+            print(f"  Val Macro F1: {val_metrics['macro_f1']:.4f}")
+            print(f"  Per-class F1:")
+            for cls_name, f1 in val_metrics['per_class_f1'].items():
+                marker = " ← DRAGGING" if f1 < val_metrics['macro_f1'] - 0.05 else ""
+                print(f"    {cls_name}: {f1:.4f}{marker}")
+            
+            # ---- Confusion matrix ----
+            cm_path = f"{cfg.paths.output_dir}/logs/fold{fold_idx}_epoch{epoch}_cm.png"
+            plot_confusion_matrix(
+                val_metrics['all_labels'], val_metrics['all_preds'],
+                cfg.class_names, cm_path
+            )
+            
+            # ---- Save best model ----
+            if val_metrics['macro_f1'] > best_f1:
+                best_f1 = val_metrics['macro_f1']
+                best_epoch = epoch
+                best_model_path = f"{cfg.paths.output_dir}/checkpoints/fold{fold_idx}_best.pt"
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'scaler_state_dict': scaler.state_dict(),
+                    'macro_f1': best_f1,
+                    'per_class_f1': val_metrics['per_class_f1'],
+                    'cfg': cfg,
+                    'fold': fold_idx,
+                    'backbone': cfg.model.backbone
+                }, best_model_path)
+                print(f"  ★ New best model saved! F1={best_f1:.4f}")
+            
+            # ---- Early stopping ----
+            early_stopper(val_metrics['macro_f1'])
+            if early_stopper.should_stop:
+                print(f"\nEarly stopping at epoch {epoch}. Best F1={best_f1:.4f} at epoch {best_epoch}")
+                break
+        else:
+            # Skip validation, just log training loss
+            print(f"Epoch {epoch}: Train Loss={train_metrics['loss']:.4f} (validation skipped, §13)")
+            val_metrics = None
         
-        # ---- Confusion matrix ----
-        cm_path = f"{cfg.paths.output_dir}/logs/fold{fold_idx}_epoch{epoch}_cm.png"
-        plot_confusion_matrix(
-            val_metrics['all_labels'], val_metrics['all_preds'],
-            cfg.class_names, cm_path
-        )
+        # ---- GPU memory tracking (§14) ----
+        if torch.cuda.is_available():
+            gpu_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+            peak_gpu_mb = max(peak_gpu_mb, gpu_mb)
         
-        # ---- Save best model ----
-        if val_metrics['macro_f1'] > best_f1:
-            best_f1 = val_metrics['macro_f1']
-            best_epoch = epoch
-            best_model_path = f"{cfg.paths.output_dir}/checkpoints/fold{fold_idx}_best.pt"
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'macro_f1': best_f1,
-                'cfg': cfg
-            }, best_model_path)
-            print(f"  ★ New best model saved! F1={best_f1:.4f}")
-        
-        # ---- Early stopping ----
-        early_stopper(val_metrics['macro_f1'])
-        if early_stopper.should_stop:
-            print(f"\nEarly stopping at epoch {epoch}. Best F1={best_f1:.4f} at epoch {best_epoch}")
-            break
+        epoch_time = time.time() - epoch_start
         
         history.append({
             'epoch': epoch,
             'train_loss': train_metrics['loss'],
-            'val_loss': val_metrics['loss'],
-            'val_macro_f1': val_metrics['macro_f1'],
-            **{f'f1_{k}': v for k, v in val_metrics['per_class_f1'].items()}
+            'val_loss': val_metrics['loss'] if val_metrics else None,
+            'val_macro_f1': val_metrics['macro_f1'] if val_metrics else None,
+            'epoch_time_seconds': epoch_time,
+            'gpu_memory_mb': peak_gpu_mb,
+            **({
+                f'f1_{k}': v for k, v in val_metrics['per_class_f1'].items()
+            } if val_metrics else {})
         })
+    
+    total_time = time.time() - fold_start_time
     
     return {
         'best_macro_f1': best_f1,
         'best_epoch': best_epoch,
         'best_model_path': best_model_path,
-        'history': history
+        'history': history,
+        'total_time_seconds': total_time,
+        'peak_gpu_memory_mb': peak_gpu_mb
     }
 ```
 
@@ -332,14 +384,17 @@ Save to: `outputs/logs/fold{fold_idx}_training_curves.png`
 
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
-| **Optimizer** | AdamW | Better generalization than Adam (decoupled weight decay) |
-| **LR** | 3e-4 (head), 3e-5 (backbone) | Standard for fine-tuning |
-| **Weight decay** | 1e-4 | Regularization |
+| **Optimizer** | AdamW | Better generalization than Adam (decoupled weight decay) (§10) |
+| **Head LR** | 1e-3 (Stage 1) | Higher for classification head (§9) |
+| **Fine-tune LR** | 1e-4 (Stage 2) | Lower to preserve pretrained features (§9) |
+| **Backbone LR** | 1e-5 (Stage 2) | fine_tune_lr × backbone_lr_factor (§9) |
+| **Weight decay** | 1e-4 | Regularization (§10) |
 | **Epochs** | 30 | With early stopping, usually converges in 15–25 |
 | **Batch size** | 32 | Fits on T4/P100; increase to 64 if memory allows |
-| **AMP** | Enabled | ~2× speedup, minimal accuracy loss |
+| **AMP** | Enabled | ~2× speedup, minimal accuracy loss (§6) |
 | **Gradient clip** | 1.0 | Prevents gradient explosion during fine-tuning transition |
-| **Label smoothing** | 0.1 | Regularization + noisy label robustness |
+| **Label smoothing** | 0.1 | Regularization + noisy label robustness (§10) |
+| **Val frequency** | Every 1–3 epochs | 2–3 during exploration, 1 during final (§13) |
 
 ---
 
@@ -389,20 +444,26 @@ checkpoint = {
 training:
   epochs: 30
   batch_size: 32
-  lr: 3.0e-4
-  weight_decay: 1.0e-4
-  label_smoothing: 0.1
+  lr: 1.0e-3                     # Head LR for Stage 1 (§9)
+  fine_tune_lr: 1.0e-4            # Fine-tuning LR for Stage 2 (§9)
+  weight_decay: 1.0e-4            # AdamW regularization (§10)
+  label_smoothing: 0.1            # Range: 0.05–0.1 (§10)
   warmup_epochs: 3
-  scheduler: "cosine"            # "cosine" | "onecycle"
-  use_amp: true
+  scheduler: "cosine"             # "cosine" | "onecycle" | "plateau" (§11)
+  use_amp: true                   # Mixed precision (§6)
   gradient_clip: 1.0
-  freeze_backbone_epochs: 5
-  backbone_lr_factor: 0.1
+  freeze_backbone_epochs: 5       # Stage 1 duration (§9)
+  backbone_lr_factor: 0.1         # Stage 2 backbone LR = fine_tune_lr × this
 
 early_stopping:
   patience: 7
   min_delta: 0.001
-  monitor: "val_macro_f1"
+  monitor: "val_macro_f1"         # Primary selection metric (§12)
+
+experiment:
+  name: "baseline"                # Current experiment name (§14)
+  log_file: "src/outputs/experiments/experiment_log.csv"
+  val_every_n_epochs: 1           # 2–3 during exploration, 1 during final (§13)
 ```
 
 ---
